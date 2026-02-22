@@ -4,9 +4,9 @@ from django.contrib.postgres.signals import (
     register_type_handlers,
 )
 from django.db import NotSupportedError, router
-from django.db.migrations import AddConstraint, AddIndex, RemoveIndex
+from django.db.migrations import AddConstraint, AddIndex, RemoveConstraint, RemoveIndex
 from django.db.migrations.operations.base import Operation, OperationCategory
-from django.db.models.constraints import CheckConstraint
+from django.db.models.constraints import CheckConstraint, UniqueConstraint
 
 
 class CreateExtension(Operation):
@@ -117,6 +117,14 @@ class NotInTransactionMixin:
             raise NotSupportedError(
                 "The %s operation cannot be executed inside a transaction "
                 "(set atomic = False on the migration)." % self.__class__.__name__
+            )
+
+
+class EnsureUniqueConstraintMixin:
+    def _ensure_unique_constraint(self, constraint):
+        if not isinstance(constraint, UniqueConstraint):
+            raise TypeError(
+                f"{self.__class__.__name__}.constraint must be a UniqueConstraint."
             )
 
 
@@ -350,3 +358,74 @@ class ValidateConstraint(Operation):
                 "name": self.name,
             },
         )
+
+
+class AddConstraintConcurrently(
+    NotInTransactionMixin, EnsureUniqueConstraintMixin, AddConstraint
+):
+    """
+    Add a unique index via a UniqueConstraint using PostgreSQL's
+    CONCURRENTLY option.
+
+    Only supports UniqueConstraints defined with expressions, condition,
+    opclasses, or `includes` options, as otherwise ALTER TABLE .. ADD
+    CONSTRAINT would be used instead of CREATE INDEX.
+    """
+
+    atomic = False
+    category = OperationCategory.ADDITION
+
+    def __init__(self, model_name, constraint):
+        self._ensure_unique_constraint(constraint)
+        super().__init__(model_name, constraint)
+
+    def describe(self):
+        return "Concurrently create unique index %s on model %s" % (
+            self.constraint.name,
+            self.model_name,
+        )
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        self._ensure_not_in_transaction(schema_editor)
+        model = from_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, model):
+            schema_editor.add_constraint(model, self.constraint, concurrently=True)
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        self._ensure_not_in_transaction(schema_editor)
+        model = to_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, model):
+            schema_editor.remove_constraint(model, self.constraint, concurrently=True)
+
+
+class RemoveConstraintConcurrently(
+    NotInTransactionMixin, EnsureUniqueConstraintMixin, RemoveConstraint
+):
+    """Remove a unique index using PostgreSQL's DROP INDEX CONCURRENTLY."""
+
+    atomic = False
+    category = OperationCategory.REMOVAL
+
+    def describe(self):
+        return "Concurrently remove unique index %s from model %s" % (
+            self.name,
+            self.model_name,
+        )
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        self._ensure_not_in_transaction(schema_editor)
+        model = from_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, model):
+            from_model_state = from_state.models[app_label, self.model_name_lower]
+            constraint = from_model_state.get_constraint_by_name(self.name)
+            self._ensure_unique_constraint(constraint)
+            schema_editor.remove_constraint(model, constraint, concurrently=True)
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        self._ensure_not_in_transaction(schema_editor)
+        model = to_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, model):
+            to_model_state = to_state.models[app_label, self.model_name_lower]
+            constraint = to_model_state.get_constraint_by_name(self.name)
+            self._ensure_unique_constraint(constraint)
+            schema_editor.add_constraint(model, constraint, concurrently=True)
