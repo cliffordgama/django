@@ -41,10 +41,10 @@ class BaseConstraint:
     def constraint_sql(self, model, schema_editor):
         raise NotImplementedError("This method must be implemented by a subclass.")
 
-    def create_sql(self, model, schema_editor):
+    def create_sql(self, model, schema_editor, **kwargs):
         raise NotImplementedError("This method must be implemented by a subclass.")
 
-    def remove_sql(self, model, schema_editor):
+    def remove_sql(self, model, schema_editor, **kwargs):
         raise NotImplementedError("This method must be implemented by a subclass.")
 
     @classmethod
@@ -200,11 +200,11 @@ class CheckConstraint(BaseConstraint):
         check = self._get_check_sql(model, schema_editor)
         return schema_editor._check_sql(self.name, check)
 
-    def create_sql(self, model, schema_editor):
+    def create_sql(self, model, schema_editor, **kwargs):
         check = self._get_check_sql(model, schema_editor)
         return schema_editor._create_check_sql(model, self.name, check)
 
-    def remove_sql(self, model, schema_editor):
+    def remove_sql(self, model, schema_editor, **kwargs):
         return schema_editor._delete_check_sql(model, self.name)
 
     def validate(self, model, instance, exclude=None, using=DEFAULT_DB_ALIAS):

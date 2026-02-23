@@ -3,7 +3,7 @@ import unittest
 from migrations.test_base import OperationTestBase, OptimizerTestBase
 
 from django.db import IntegrityError, NotSupportedError, connection, transaction
-from django.db.migrations.operations import RemoveIndex, RenameIndex
+from django.db.migrations.operations import RemoveConstraint, RemoveIndex, RenameIndex
 from django.db.migrations.state import ProjectState
 from django.db.migrations.writer import OperationWriter
 from django.db.models import CheckConstraint, Index, Q, UniqueConstraint
@@ -16,12 +16,14 @@ from . import PostgreSQLTestCase
 try:
     from django.contrib.postgres.indexes import BrinIndex, BTreeIndex
     from django.contrib.postgres.operations import (
+        AddConstraintConcurrently,
         AddConstraintNotValid,
         AddIndexConcurrently,
         BloomExtension,
         CreateCollation,
         CreateExtension,
         RemoveCollation,
+        RemoveConstraintConcurrently,
         RemoveIndexConcurrently,
         ValidateConstraint,
     )
@@ -231,6 +233,159 @@ class RemoveIndexConcurrentlyTests(OperationTestBase):
         self.assertEqual(name, "RemoveIndexConcurrently")
         self.assertEqual(args, [])
         self.assertEqual(kwargs, {"model_name": "Pony", "name": "pony_pink_idx"})
+
+
+@unittest.skipUnless(connection.vendor == "postgresql", "PostgreSQL specific tests.")
+@modify_settings(INSTALLED_APPS={"append": "migrations"})
+class AddConstraintConcurrentlyTests(OptimizerTestBase, OperationTestBase):
+    app_label = "test_add_constraint_concurrently"
+
+    def test_requires_atomic_false(self):
+        project_state = self.set_up_test_model(self.app_label)
+        new_state = project_state.clone()
+        constraint = UniqueConstraint("pink", name="pony_pink_uniq")
+        operation = AddConstraintConcurrently("Pony", constraint=constraint)
+        msg = (
+            "The AddConstraintConcurrently operation cannot be executed inside "
+            "a transaction (set atomic = False on the migration)."
+        )
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            with connection.schema_editor(atomic=True) as editor:
+                operation.database_forwards(
+                    self.app_label, editor, project_state, new_state
+                )
+
+    def test_only_unique_constraints_supported(self):
+        constraint = CheckConstraint(condition=Q(pink__gte=4), name="pink_gte_check")
+        msg = "AddConstraintConcurrently.constraint must be a UniqueConstraint."
+        with self.assertRaisesMessage(TypeError, msg):
+            AddConstraintConcurrently("Pony", constraint=constraint)
+
+    def test_add(self):
+        project_state = self.set_up_test_model(self.app_label, index=False)
+        table_name = "%s_pony" % self.app_label
+        constraint = UniqueConstraint("pink", "weight", name="pony_pink_uniq")
+        new_state = project_state.clone()
+        operation = AddConstraintConcurrently("Pony", constraint=constraint)
+        self.assertEqual(
+            operation.describe(),
+            "Concurrently create unique index pony_pink_uniq on model Pony",
+        )
+        self.assertEqual(
+            operation.formatted_description(),
+            "+ Concurrently create unique index pony_pink_uniq on model Pony",
+        )
+        operation.state_forwards(self.app_label, new_state)
+        self.assertEqual(
+            len(new_state.models[self.app_label, "pony"].options["constraints"]), 1
+        )
+        self.assertIndexNotExists(table_name, ["pink", "weight"])
+        # Add constraint.
+        with connection.schema_editor(atomic=False) as editor:
+            operation.database_forwards(
+                self.app_label, editor, project_state, new_state
+            )
+        self.assertUniqueConstraintExists(table_name, ["pink", "weight"])
+        # Reversal.
+        with connection.schema_editor(atomic=False) as editor:
+            operation.database_backwards(
+                self.app_label, editor, new_state, project_state
+            )
+        self.assertIndexNotExists(table_name, ["pink", "weight"])
+        # Deconstruction.
+        name, args, kwargs = operation.deconstruct()
+        self.assertEqual(name, "AddConstraintConcurrently")
+        self.assertEqual(args, [])
+        self.assertEqual(kwargs, {"model_name": "Pony", "constraint": constraint})
+
+    def test_add_with_options(self):
+        project_state = self.set_up_test_model(self.app_label, index=False)
+        table_name = "%s_pony" % self.app_label
+        constraint = UniqueConstraint(
+            fields=["pink", "weight"], name="pony_pink_uniq", condition=Q(pink__gte=4)
+        )
+        new_state = project_state.clone()
+        operation = AddConstraintConcurrently("Pony", constraint=constraint)
+        self.assertIndexNotExists(table_name, ["pink", "weight"])
+        # Add constraint.
+        with (
+            CaptureQueriesContext(connection) as ctx,
+            connection.schema_editor(atomic=False) as editor,
+        ):
+            operation.database_forwards(
+                self.app_label, editor, project_state, new_state
+            )
+        self.assertIn('WHERE "pink" >= 4', ctx.captured_queries[-1]["sql"])
+        self.assertIn("CONCURRENTLY", ctx.captured_queries[-1]["sql"])
+        self.assertUniqueConstraintExists(table_name, ["pink", "weight"])
+        # Reversal.
+        with connection.schema_editor(atomic=False) as editor:
+            operation.database_backwards(
+                self.app_label, editor, new_state, project_state
+            )
+        self.assertIndexNotExists(table_name, ["pink", "weight"])
+
+    def test_constraint_using_alter_table_does_not_use_concurrently(self):
+        # A UniqueConstraint that defines fields with no index options is
+        # created using ALTER TABLE ADD CONSTRAINT, which does not support the
+        # CONCURRENTLY option. In that case AddConstraintConcurrently will
+        # behave like a regular AddConstraint operation.
+        project_state = self.set_up_test_model(self.app_label, index=False)
+        table_name = "%s_pony" % self.app_label
+        constraint = UniqueConstraint(fields=["pink"], name="pony_pink_uniq")
+        new_state = project_state.clone()
+        operation = AddConstraintConcurrently("Pony", constraint=constraint)
+        self.assertIndexNotExists(table_name, ["pink"])
+        # Add constraint.
+        with (
+            CaptureQueriesContext(connection) as ctx,
+            connection.schema_editor(atomic=False) as editor,
+        ):
+            operation.database_forwards(
+                self.app_label, editor, project_state, new_state
+            )
+        self.assertIn(
+            f'ALTER TABLE "{table_name}" ADD CONSTRAINT',
+            ctx.captured_queries[-1]["sql"],
+        )
+        self.assertUniqueConstraintExists(table_name, ["pink"])
+        # Reversal.
+        with (
+            CaptureQueriesContext(connection) as ctx,
+            connection.schema_editor(atomic=False) as editor,
+        ):
+            operation.database_backwards(
+                self.app_label, editor, new_state, project_state
+            )
+        self.assertIn(
+            f'ALTER TABLE "{table_name}" DROP CONSTRAINT',
+            ctx.captured_queries[-1]["sql"],
+        )
+        self.assertIndexNotExists(table_name, ["pink"])
+
+    def test_reduce_add_remove_concurrently(self):
+        self.assertOptimizesTo(
+            [
+                AddConstraintConcurrently(
+                    "Pony",
+                    constraint=UniqueConstraint(fields=["pink"], name="pony_pink_uniq"),
+                ),
+                RemoveConstraintConcurrently("Pony", "pony_pink_uniq"),
+            ],
+            [],
+        )
+
+    def test_reduce_add_remove(self):
+        self.assertOptimizesTo(
+            [
+                AddConstraintConcurrently(
+                    "Pony",
+                    constraint=UniqueConstraint(fields=["pink"], name="pony_pink_uniq"),
+                ),
+                RemoveConstraint("Pony", "pony_pink_uniq"),
+            ],
+            [],
+        )
 
 
 class NoMigrationRouter:
