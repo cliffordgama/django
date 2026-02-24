@@ -22,6 +22,10 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         "CREATE INDEX CONCURRENTLY %(name)s ON %(table)s%(using)s "
         "(%(columns)s)%(include)s%(extra)s%(condition)s"
     )
+    sql_create_unique_index_concurrently = (
+        "CREATE UNIQUE INDEX CONCURRENTLY %(name)s ON %(table)s "
+        "(%(columns)s)%(include)s%(nulls_distinct)s%(condition)s"
+    )
     sql_delete_index = "DROP INDEX IF EXISTS %(name)s"
     sql_delete_index_concurrently = "DROP INDEX CONCURRENTLY IF EXISTS %(name)s"
 
@@ -378,3 +382,75 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             )
             row = cursor.fetchone()
             return row[0] if row else None
+
+    def add_constraint(self, model, constraint, concurrently=False):
+        sql = constraint.create_sql(model, self, concurrently=concurrently)
+        if sql:
+            self.execute(sql, params=None)
+
+    def remove_constraint(self, model, constraint, concurrently=False):
+        sql = constraint.remove_sql(model, self, concurrently=concurrently)
+        if sql:
+            self.execute(sql)
+
+    def _create_unique_sql(
+        self,
+        model,
+        fields,
+        name=None,
+        condition=None,
+        deferrable=None,
+        include=None,
+        opclasses=None,
+        expressions=None,
+        nulls_distinct=None,
+        concurrently=False,
+    ):
+        statement = super()._create_unique_sql(
+            model,
+            fields,
+            name=name,
+            condition=condition,
+            deferrable=deferrable,
+            include=include,
+            opclasses=opclasses,
+            expressions=expressions,
+            nulls_distinct=nulls_distinct,
+        )
+        if (
+            statement is not None
+            and concurrently
+            and statement.template == self.sql_create_unique_index
+        ):
+            statement.template = self.sql_create_unique_index_concurrently
+        return statement
+
+    def _delete_unique_sql(
+        self,
+        model,
+        name,
+        condition=None,
+        deferrable=None,
+        include=None,
+        opclasses=None,
+        expressions=None,
+        nulls_distinct=None,
+        concurrently=False,
+    ):
+        statement = super()._delete_unique_sql(
+            model,
+            name,
+            condition=condition,
+            deferrable=deferrable,
+            include=include,
+            opclasses=opclasses,
+            expressions=expressions,
+            nulls_distinct=nulls_distinct,
+        )
+        if (
+            statement is not None
+            and concurrently
+            and statement.template == self.sql_delete_index
+        ):
+            statement.template = self.sql_delete_index_concurrently
+        return statement

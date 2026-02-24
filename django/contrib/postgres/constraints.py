@@ -136,14 +136,14 @@ class ExclusionConstraint(CheckPostgresInstalledMixin, BaseConstraint):
             deferrable=schema_editor._deferrable_constraint_sql(self.deferrable),
         )
 
-    def create_sql(self, model, schema_editor):
+    def create_sql(self, model, schema_editor, **kwargs):
         return Statement(
             "ALTER TABLE %(table)s ADD %(constraint)s",
             table=Table(model._meta.db_table, schema_editor.quote_name),
             constraint=self.constraint_sql(model, schema_editor),
         )
 
-    def remove_sql(self, model, schema_editor):
+    def remove_sql(self, model, schema_editor, **kwargs):
         return schema_editor._delete_constraint_sql(
             schema_editor.sql_delete_check,
             model,
