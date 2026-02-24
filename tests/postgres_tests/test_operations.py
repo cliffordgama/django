@@ -388,6 +388,99 @@ class AddConstraintConcurrentlyTests(OptimizerTestBase, OperationTestBase):
         )
 
 
+@unittest.skipUnless(connection.vendor == "postgresql", "PostgreSQL specific tests.")
+@modify_settings(INSTALLED_APPS={"append": "migrations"})
+class RemoveConstraintConcurrentlyTests(OperationTestBase):
+    app_label = "test_remove_constraint_concurrently"
+
+    def test_requires_atomic_false(self):
+        project_state = self.set_up_test_model(self.app_label)
+        new_state = project_state.clone()
+        operation = RemoveConstraintConcurrently("Pony", "pony_pink_uniq")
+        msg = (
+            "The RemoveConstraintConcurrently operation cannot be executed inside "
+            "a transaction (set atomic = False on the migration)."
+        )
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            with connection.schema_editor(atomic=True) as editor:
+                operation.database_forwards(
+                    self.app_label, editor, project_state, new_state
+                )
+
+    def test_remove(self):
+        project_state = self.set_up_test_model(
+            self.app_label,
+            constraints=[
+                UniqueConstraint("pink", name="pony_pink_uniq"),
+            ],
+        )
+        table_name = "%s_pony" % self.app_label
+        new_state = project_state.clone()
+        operation = RemoveConstraintConcurrently("Pony", "pony_pink_uniq")
+        self.assertTableExists(table_name)
+        self.assertUniqueConstraintExists(table_name, ["pink"])
+        # Remove constraint.
+        with (
+            CaptureQueriesContext(connection) as ctx,
+            connection.schema_editor(atomic=False) as editor,
+        ):
+            operation.database_forwards(
+                self.app_label, editor, project_state, new_state
+            )
+        self.assertIndexNotExists(table_name, ["pink"])
+        self.assertIn("DROP INDEX CONCURRENTLY", ctx.captured_queries[-1]["sql"])
+        # Reversal.
+        with connection.schema_editor(atomic=False) as editor:
+            operation.database_backwards(
+                self.app_label, editor, new_state, project_state
+            )
+        self.assertUniqueConstraintExists(table_name, ["pink"])
+        # Deconstruction.
+        name, args, kwargs = operation.deconstruct()
+        self.assertEqual(name, "RemoveConstraintConcurrently")
+        self.assertEqual(args, [])
+        self.assertEqual(kwargs, {"model_name": "Pony", "name": "pony_pink_uniq"})
+
+    def test_op_on_constraint_using_alter_table(self):
+        project_state = self.set_up_test_model(
+            self.app_label,
+            constraints=[
+                UniqueConstraint(fields=["pink"], name="pony_pink_uniq"),
+            ],
+        )
+        table_name = f"{self.app_label}_pony"
+        new_state = project_state.clone()
+        operation = RemoveConstraintConcurrently("Pony", "pony_pink_uniq")
+        self.assertTableExists(table_name)
+        self.assertUniqueConstraintExists(table_name, ["pink"])
+        # Remove constraint.
+        with (
+            CaptureQueriesContext(connection) as ctx,
+            connection.schema_editor(atomic=False) as editor,
+        ):
+            operation.database_forwards(
+                self.app_label, editor, project_state, new_state
+            )
+        self.assertIndexNotExists(table_name, ["pink"])
+        self.assertIn(
+            f'ALTER TABLE "{table_name}" DROP CONSTRAINT',
+            ctx.captured_queries[-1]["sql"],
+        )
+        # Reversal.
+        with (
+            CaptureQueriesContext(connection) as ctx,
+            connection.schema_editor(atomic=False) as editor,
+        ):
+            operation.database_backwards(
+                self.app_label, editor, new_state, project_state
+            )
+        self.assertUniqueConstraintExists(table_name, ["pink"])
+        self.assertIn(
+            f'ALTER TABLE "{table_name}" ADD CONSTRAINT',
+            ctx.captured_queries[-1]["sql"],
+        )
+
+
 class NoMigrationRouter:
     def allow_migrate(self, db, app_label, **hints):
         return False
